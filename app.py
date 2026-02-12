@@ -10,34 +10,45 @@ import io
 import base64
 
 # ==========================================
-# 1. 强力修复补丁 (Robust Monkey Patch)
+# 1. 强力修复补丁 (必须放在最前面)
 # ==========================================
-# 解决 Streamlit 1.35+ 导致 st_canvas 崩溃的问题
+# 修复 Streamlit 1.35+ 导致 st_canvas 崩溃的问题
 try:
     from streamlit.elements import image as st_image
+    from streamlit.elements.lib import image_utils
     
+    # 强制覆盖 Streamlit 内部的 image_to_url 函数
     def custom_image_to_url(image, width=None, clamp=False, channels="RGB", output_format="JPEG", image_id=None):
-        if isinstance(image, Image.Image):
+        # 将图片转为 Base64 字符串，绕过 Streamlit 的内部检查
+        if isinstance(image, (Image.Image, np.ndarray)):
+            # 如果是 numpy 数组，先转 PIL
+            if isinstance(image, np.ndarray):
+                image = Image.fromarray(image)
+                
             buffered = io.BytesIO()
             fmt = output_format if output_format else "PNG"
             try:
                 image.save(buffered, format=fmt)
-            except ValueError:
+            except Exception:
                 image.save(buffered, format="PNG")
                 fmt = "PNG"
             img_str = base64.b64encode(buffered.getvalue()).decode()
             return f"data:image/{fmt.lower()};base64,{img_str}"
         return ""
 
+    # 应用补丁
     st_image.image_to_url = custom_image_to_url
+    if hasattr(image_utils, 'image_to_url'):
+        image_utils.image_to_url = custom_image_to_url
 except ImportError:
     pass
 
+# 补丁必须在导入 st_canvas 之前执行
 from streamlit_drawable_canvas import st_canvas
 from openai import OpenAI
 
 # ==========================================
-# 2. 页面与状态初始化
+# 2. 页面配置
 # ==========================================
 st.set_page_config(
     page_title="SpectraMind 光电分析平台",
@@ -52,7 +63,22 @@ if 'roi_stats' not in st.session_state:
     st.session_state.roi_stats = {}
 
 # ==========================================
-# 3. 科学仿真算法库
+# 3. 辅助函数：灵活读取 Secrets (修复图2/3的问题)
+# ==========================================
+def get_secret(key):
+    """
+    尝试从 st.secrets 中读取配置，兼容有 [llm] 和没有 [llm] 的情况
+    """
+    # 1. 尝试从 [llm] 节点读取 (代码里的标准写法)
+    if "llm" in st.secrets and key in st.secrets["llm"]:
+        return st.secrets["llm"][key]
+    # 2. 尝试从根节点读取 (兼容您截图中的写法)
+    if key in st.secrets:
+        return st.secrets[key]
+    return None
+
+# ==========================================
+# 4. 算法与仿真
 # ==========================================
 def generate_pseudo_spectrum_curve(n_points=1000, n_peaks=5, noise_level=0.05):
     wavelengths = np.linspace(400, 1000, n_points)
@@ -95,16 +121,18 @@ def create_synthetic_diffraction_image(width=800, height=600):
     return Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
 
 # ==========================================
-# 4. LLM 智能接口
+# 5. LLM 接口
 # ==========================================
 def get_ai_physical_report(stats_json):
-    if "llm" not in st.secrets:
-        return {"error": "未配置 secrets.toml", "anomaly_detected": True, "physical_interpretation": "配置缺失", "confidence_score": 0.0, "detected_elements": [], "sample_quality": "Critical"}
+    api_key = get_secret("api_key")
+    base_url = get_secret("base_url")
+    model = get_secret("model")
 
-    client = OpenAI(
-        api_key=st.secrets["llm"]["api_key"],
-        base_url=st.secrets["llm"]["base_url"]
-    )
+    # 如果读取不到配置，返回错误
+    if not api_key or not base_url or not model:
+        return {"error": "未读取到 Secrets 配置。请检查 Streamlit Cloud 设置。", "anomaly_detected": True, "physical_interpretation": "配置缺失", "confidence_score": 0.0, "detected_elements": [], "sample_quality": "Critical"}
+
+    client = OpenAI(api_key=api_key, base_url=base_url)
     
     report_schema = {
         "type": "json_schema",
@@ -133,7 +161,7 @@ def get_ai_physical_report(stats_json):
 
     try:
         completion = client.chat.completions.create(
-            model=st.secrets["llm"]["model"],
+            model=model,
             messages=[
                 {"role": "system", "content": "You are a helpful scientific assistant."},
                 {"role": "user", "content": prompt}
@@ -145,13 +173,12 @@ def get_ai_physical_report(stats_json):
         return {"error": str(e), "anomaly_detected": True, "physical_interpretation": "API Error", "confidence_score": 0.0, "detected_elements": [], "sample_quality": "Critical"}
 
 # ==========================================
-# 5. UI 布局与交互逻辑
+# 6. UI 布局
 # ==========================================
 with st.sidebar:
     st.title("SpectraMind 🔬")
-    st.caption("v1.1.0 | 上传功能已修复") 
+    st.caption("v1.2.1 | 修复 Secrets & Columns") 
     st.markdown("---")
-    st.subheader("⚙️ 硬件参数模拟")
     integration_time = st.slider("积分时间 (ms)", 10, 2000, 100)
     gain_level = st.select_slider("增益等级", options=["Low", "Medium", "High", "Ultra"])
     st.markdown("---")
@@ -182,12 +209,11 @@ with tab_monitor:
         fig.update_layout(template=plot_theme, height=450, margin=dict(l=20, r=20, t=20, b=20))
         st.plotly_chart(fig, use_container_width=True)
 
-# --- TAB 2 (含上传修复) ---
+# --- TAB 2 ---
 with tab_vision:
     st.markdown("### 高光谱图像 ROI 提取")
     
-    # [NEW] 添加上传控件
-    uploaded_file = st.file_uploader("📤 上传实验图像 (支持 PNG, JPG, JPEG)", type=["png", "jpg", "jpeg"])
+    uploaded_file = st.file_uploader("📤 上传实验图像 (支持 PNG, JPG)", type=["png", "jpg", "jpeg"])
     
     if uploaded_file:
         try:
@@ -197,21 +223,18 @@ with tab_vision:
             st.error(f"图像解析失败: {e}")
             original_image = create_synthetic_diffraction_image(800, 600)
     else:
-        # 如果没有上传，使用默认模拟图
         original_image = create_synthetic_diffraction_image(800, 600)
-        st.caption("ℹ️ 当前显示为模拟图像。上传文件后将自动替换。")
     
     col_canvas, col_result = st.columns([1.5, 1])
     
     with col_canvas:
         CANVAS_WIDTH = 500
         orig_w, orig_h = original_image.size
-        # 保持比例计算高度
         CANVAS_HEIGHT = int(CANVAS_WIDTH * orig_h / orig_w)
         
         st.markdown(f"**画布视图** ({orig_w}x{orig_h})")
-        st.info("👇 在下方图片上拖拽鼠标绘制矩形框")
         
+        # 调用绘图组件
         canvas_result = st_canvas(
             fill_color="rgba(255, 0, 0, 0.2)",
             stroke_width=2,
@@ -231,7 +254,6 @@ with tab_vision:
         if canvas_result.json_data is not None and len(canvas_result.json_data["objects"]) > 0:
             obj = canvas_result.json_data["objects"][-1]
             
-            # 坐标映射
             scale_x = orig_w / CANVAS_WIDTH
             scale_y = orig_h / CANVAS_HEIGHT
             
@@ -285,7 +307,8 @@ with tab_report:
                 else:
                     status.update(label="完成", state="complete")
                     st.divider()
-                    c1, c2 = st.columns()
+                    # 修复: 明确指定列数为2，解决 TypeError
+                    c1, c2 = st.columns(2)
                     with c1:
                         st.metric("置信度", f"{report_data.get('confidence_score', 0)*100:.1f}%")
                         st.info(f"质量评估: {report_data.get('sample_quality')}")
