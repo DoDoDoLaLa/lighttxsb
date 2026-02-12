@@ -7,18 +7,39 @@ import plotly.graph_objects as go
 from PIL import Image, ImageDraw
 import cv2
 import io
+import base64
 
 # ==========================================
-# 1. 核心修复补丁 (Monkey Patch)
+# 1. 强力修复补丁 (Robust Monkey Patch)
 # ==========================================
-# 解决 Streamlit 1.32+ 中 'image_to_url' 属性缺失导致的 Crash
+# 解决 Streamlit 1.35+ 导致 st_canvas 崩溃的问题
+# 我们定义一个自定义函数，绕过 Streamlit 内部报错的检查逻辑，直接生成 Base64 图片
 try:
     from streamlit.elements import image as st_image
-    if not hasattr(st_image, 'image_to_url'):
-        from streamlit.elements.lib import image_utils
-        st_image.image_to_url = image_utils.image_to_url
+    
+    def custom_image_to_url(image, width=None, clamp=False, channels="RGB", output_format="JPEG", image_id=None):
+        """
+        自定义的图片转URL函数，专门用于修复 st_canvas 在新版 Streamlit 中的兼容性问题。
+        它不依赖 streamlit 内部 API，而是直接使用 PIL 和 base64 进行转换。
+        """
+        if isinstance(image, Image.Image):
+            buffered = io.BytesIO()
+            # 默认使用 PNG 以保证高质量和透明度支持
+            fmt = output_format if output_format else "PNG"
+            try:
+                image.save(buffered, format=fmt)
+            except ValueError:
+                image.save(buffered, format="PNG")
+                fmt = "PNG"
+            img_str = base64.b64encode(buffered.getvalue()).decode()
+            return f"data:image/{fmt.lower()};base64,{img_str}"
+        return ""
+
+    # 强制替换 Streamlit 的内部函数
+    st_image.image_to_url = custom_image_to_url
+
 except ImportError:
-    pass  # 针对旧版本的防御性编程
+    pass
 
 from streamlit_drawable_canvas import st_canvas
 from openai import OpenAI
@@ -56,8 +77,7 @@ def generate_pseudo_spectrum_curve(n_points=1000, n_peaks=5, noise_level=0.05):
     # 2. 随机生成高斯特征峰
     np.random.seed(int(time.time())) # 确保每次点击生成不同光谱
     
-    # [FIXED] 修复了之前的 SyntaxError
-    peaks_info = []
+    peaks_info = [] # 初始化列表
     
     for _ in range(n_peaks):
         center = np.random.uniform(450, 950)
@@ -180,7 +200,6 @@ def get_ai_physical_report(stats_json):
     try:
         completion = client.chat.completions.create(
             model=st.secrets["llm"]["model"],
-            # [FIXED] 修正了 API 调用参数格式
             messages=[
                 {"role": "system", "content": "You are a helpful scientific assistant."},
                 {"role": "user", "content": prompt}
@@ -198,7 +217,7 @@ def get_ai_physical_report(stats_json):
 # 5.1 Sidebar: 全局控制
 with st.sidebar:
     st.title("SpectraMind 🔬")
-    st.caption("v1.0.4 | 开放访问模式") # 已移除密码显示
+    st.caption("v1.0.5 | 稳定版") 
     st.markdown("---")
     
     st.subheader("⚙️ 硬件参数模拟")
@@ -260,7 +279,7 @@ with tab_monitor:
 # --- TAB 2: ROI 视觉分析 (核心难点) ---
 with tab_vision:
     st.markdown("### 高光谱图像 ROI 提取")
-    st.info("💡 提示：在左侧图像上绘制矩形，右侧将自动显示该区域的原始分辨率切片及统计数据。无需手动计算坐标缩放。")
+    st.info("💡 提示：在左侧图像上绘制矩形，右侧将自动显示该区域的原始分辨率切片及统计数据。")
     
     col_canvas, col_result = st.columns([1.5, 1])
     
@@ -277,6 +296,7 @@ with tab_vision:
         st.markdown(f"**画布视图** (显示尺寸: {CANVAS_WIDTH}x{CANVAS_HEIGHT})")
         
         # 调用 Drawable Canvas
+        # 注意：这里的 background_image 现在会通过我们自定义的补丁处理
         canvas_result = st_canvas(
             fill_color="rgba(255, 0, 0, 0.2)",
             stroke_width=2,
@@ -306,8 +326,6 @@ with tab_vision:
             rect_x = int(obj["left"] * scale_x)
             rect_y = int(obj["top"] * scale_y)
             rect_w = int(obj["width"] * obj["scaleX"] * scale_x)
-            
-            # [FIXED] 修正了这里的类型错误 (obj * scale_y -> obj["scaleY"] * scale_y)
             rect_h = int(obj["height"] * obj["scaleY"] * scale_y)
             
             # 边界保护
